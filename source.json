@@ -1,0 +1,11 @@
+{
+  "name": "MCP for Unity — VPM Mirror",
+  "id": "com.coplaydev.unity-mcp.vpm-mirror",
+  "url": "https://NexRushVr.github.io/unity-mcp-vpm/index.json",
+  "author": "NexRushVr",
+  "description": "Unofficial VPM mirror of CoplayDev/unity-mcp, auto-synced daily. Allows installation via VCC or ALCOM.",
+  "infoLink": {
+    "url": "https://github.com/CoplayDev/unity-mcp",
+    "text": "Source: CoplayDev/unity-mcp"
+  }
+}

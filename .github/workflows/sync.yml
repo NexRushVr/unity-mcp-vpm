@@ -1,0 +1,238 @@
+name: Sync & Publish VPM Listing
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Check for new versions every day at 08:00 UTC
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pkg.outputs.version }}
+      changed: ${{ steps.check.outputs.changed }}
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Sparse-checkout unity-mcp (MCPForUnity only)
+        run: |
+          git clone --no-checkout --depth 1 \
+            https://github.com/CoplayDev/unity-mcp.git unity-mcp-src
+          cd unity-mcp-src
+          git sparse-checkout init --cone
+          git sparse-checkout set MCPForUnity
+          git checkout main
+
+      - name: Read package version
+        id: pkg
+        run: |
+          VERSION=$(jq -r '.version' unity-mcp-src/MCPForUnity/package.json)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+      - name: Check if this version is already released
+        id: check
+        run: |
+          VERSION="${{ steps.pkg.outputs.version }}"
+          TAG="v${VERSION}"
+          if gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Version $VERSION already published — skipping."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New version $VERSION found — publishing."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build zip package
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          VERSION="${{ steps.pkg.outputs.version }}"
+          ZIP_NAME="com.coplaydev.unity-mcp-${VERSION}.zip"
+          cd unity-mcp-src/MCPForUnity
+          zip -r "../../${ZIP_NAME}" .
+          cd ../..
+          echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release with zip
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          VERSION="${{ steps.pkg.outputs.version }}"
+          TAG="v${VERSION}"
+          gh release create "$TAG" \
+            "${{ env.ZIP_NAME }}" \
+            --repo "${{ github.repository }}" \
+            --title "MCP for Unity v${VERSION}" \
+            --notes "Auto-synced from [CoplayDev/unity-mcp](https://github.com/CoplayDev/unity-mcp) v${VERSION}."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    needs: sync
+    runs-on: ubuntu-latest
+    # Run if we just pushed a new release OR on any push to main (to rebuild index)
+    if: always()
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Build index.json from all releases
+        run: |
+          REPO="${{ github.repository }}"
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          PAGES_URL="https://${REPO_OWNER}.github.io/${REPO_NAME}"
+
+          # Fetch all releases and their assets
+          RELEASES=$(gh api "repos/${REPO}/releases" --paginate)
+
+          # Build packages object
+          PACKAGES_JSON="{}"
+
+          while IFS= read -r release; do
+            TAG=$(echo "$release" | jq -r '.tag_name')
+            VERSION="${TAG#v}"
+
+            # Find the zip asset URL
+            ZIP_URL=$(echo "$release" | jq -r \
+              '.assets[] | select(.name | endswith(".zip")) | .browser_download_url' \
+              | head -1)
+
+            if [ -z "$ZIP_URL" ]; then
+              continue
+            fi
+
+            # Download and extract package.json from the zip to get full manifest
+            TMP_DIR=$(mktemp -d)
+            curl -sL "$ZIP_URL" -o "$TMP_DIR/pkg.zip"
+            unzip -q "$TMP_DIR/pkg.zip" "package.json" -d "$TMP_DIR" 2>/dev/null || true
+
+            if [ ! -f "$TMP_DIR/package.json" ]; then
+              rm -rf "$TMP_DIR"
+              continue
+            fi
+
+            MANIFEST=$(cat "$TMP_DIR/package.json")
+            PKG_NAME=$(echo "$MANIFEST" | jq -r '.name')
+
+            # Inject url and zipSHA256 into the manifest
+            SHA=$(sha256sum "$TMP_DIR/pkg.zip" | awk '{print $1}')
+            MANIFEST=$(echo "$MANIFEST" | jq \
+              --arg url "$ZIP_URL" \
+              --arg sha "$SHA" \
+              '. + {url: $url, zipSHA256: $sha}')
+
+            # Merge into packages
+            PACKAGES_JSON=$(echo "$PACKAGES_JSON" | jq \
+              --arg pkg "$PKG_NAME" \
+              --arg ver "$VERSION" \
+              --argjson manifest "$MANIFEST" \
+              '.[$pkg].versions[$ver] = $manifest')
+
+            rm -rf "$TMP_DIR"
+          done < <(echo "$RELEASES" | jq -c '.[]')
+
+          # Write final index.json
+          jq -n \
+            --arg name "MCP for Unity — VPM Mirror" \
+            --arg id "com.coplaydev.unity-mcp.vpm-mirror" \
+            --arg url "${PAGES_URL}/index.json" \
+            --arg author "$REPO_OWNER" \
+            --argjson packages "$PACKAGES_JSON" \
+            '{
+              name: $name,
+              id: $id,
+              url: $url,
+              author: $author,
+              packages: $packages
+            }' > Website/index.json
+
+          echo "Generated index.json:"
+          cat Website/index.json | jq '{name,id,url,package_count: (.packages | length)}'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Copy website assets
+        run: |
+          cp Website/index.json Website/index.json  # already there
+          # Generate a simple landing page
+          cat > Website/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <title>MCP for Unity — VPM Repository</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+              body { font-family: system-ui, sans-serif; max-width: 700px; margin: 60px auto; padding: 0 20px; }
+              code { background: #f0f0f0; padding: 4px 8px; border-radius: 4px; word-break: break-all; }
+              .btn { display: inline-block; padding: 10px 20px; background: #5865f2; color: #fff;
+                     text-decoration: none; border-radius: 6px; margin-top: 10px; }
+            </style>
+          </head>
+          <body>
+            <h1>🤖 MCP for Unity — VPM Mirror</h1>
+            <p>This is an unofficial VPM repository mirror of
+               <a href="https://github.com/CoplayDev/unity-mcp">CoplayDev/unity-mcp</a>,
+               auto-synced daily so you can install it via
+               <a href="https://vcc.docs.vrchat.com/">VCC</a> /
+               <a href="https://github.com/anatawa12/AvatarOptimizer">ALCOM</a>.</p>
+
+            <h2>Add to VCC / ALCOM</h2>
+            <p>Paste this URL into your package manager's <em>Add Repository</em> dialog:</p>
+            <code id="url"></code>
+            <br>
+            <a class="btn" id="vcc-btn" href="#">Add to VCC</a>
+
+            <h2>Packages</h2>
+            <div id="packages">Loading…</div>
+
+            <script>
+              const base = location.href.replace(/index\.html$/, '');
+              const indexUrl = base + 'index.json';
+              document.getElementById('url').textContent = indexUrl;
+              document.getElementById('vcc-btn').href = 'vcc://vpm/addRepo?url=' + encodeURIComponent(indexUrl);
+
+              fetch('index.json').then(r => r.json()).then(data => {
+                const pkgs = data.packages || {};
+                const html = Object.entries(pkgs).map(([id, pkg]) => {
+                  const versions = Object.keys(pkg.versions).sort().reverse();
+                  return `<p><strong>${id}</strong><br>Versions: ${versions.join(', ')}</p>`;
+                }).join('');
+                document.getElementById('packages').innerHTML = html || '<p>No packages found.</p>';
+              });
+            </script>
+          </body>
+          </html>
+          EOF
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: Website/
+
+  deploy:
+    needs: publish
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
