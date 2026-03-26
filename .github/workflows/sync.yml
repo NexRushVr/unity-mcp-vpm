@@ -170,7 +170,6 @@ jobs:
 
       - name: Copy website assets
         run: |
-          cp Website/index.json Website/index.json  # already there
           # Generate a simple landing page
           cat > Website/index.html << 'EOF'
           <!DOCTYPE html>
