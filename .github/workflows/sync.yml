@@ -31,7 +31,8 @@ jobs:
           cd unity-mcp-src
           git sparse-checkout init --cone
           git sparse-checkout set MCPForUnity
-          git checkout main
+          DEFAULT_BRANCH="$(git symbolic-ref --short refs/remotes/origin/HEAD | sed 's@^origin/@@')"
+          git checkout "$DEFAULT_BRANCH"
 
       - name: Read package version
         id: pkg
